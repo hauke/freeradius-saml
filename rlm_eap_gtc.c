@@ -20,17 +20,17 @@
  * Copyright 2003,2006  The FreeRADIUS server project
  */
 
-#include <freeradius-devel/ident.h>
+#include <freeradius/ident.h>
 RCSID("$Id$")
 
-#include <freeradius-devel/autoconf.h>
+#include <freeradius/autoconf.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "eap.h"
 
-#include <freeradius-devel/rad_assert.h>
+#include <freeradius/rad_assert.h>
 
 /*
  *	EAP-GTC is just ASCII data carried inside of the EAP session.
@@ -105,18 +105,61 @@ static int gtc_attach(CONF_SECTION *cs, void **instance)
 	return 0;
 }
 
+#define CHALLANGE_SIZE sizeof(char) * 4096
+
+static char *getChallenge(VALUE_PAIR *config)
+{
+	VALUE_PAIR *vp;
+
+	vp = pairfind(config, PW_CRYPT_PASSWORD);
+	if (vp) {
+		char *challenge = getChallenge(vp->next);
+		if (challenge) {
+			int size = strlen(challenge) + vp->length + 1;
+			char *result = malloc(size);
+			snprintf(result, size, "%.*s%s", (int)vp->length, vp->vp_strvalue, challenge);
+			free(challenge);
+			return result;
+		} else {
+			int size = vp->length + 1;
+			char *result = malloc(size);
+			snprintf(result, size, "%.*s", (int)vp->length, vp->vp_strvalue);
+			return result;
+		}
+	} else {
+		return NULL;
+	}
+}
+
 /*
  *	Initiate the EAP-GTC session by sending a challenge to the peer.
  */
 static int gtc_initiate(void *type_data, EAP_HANDLER *handler)
 {
-	char challenge_str[1024];
+	char *challenge_str;
+	const char *challenge;
 	int length;
 	EAP_DS *eap_ds = handler->eap_ds;
 	rlm_eap_gtc_t *inst = (rlm_eap_gtc_t *) type_data;
 
-	if (!radius_xlat(challenge_str, sizeof(challenge_str), inst->challenge, handler->request, NULL)) {
-		radlog(L_ERR, "rlm_eap_gtc: xlat of \"%s\" failed", inst->challenge);
+	radlog(L_ERR, "rlm_eap_gtc: gtc_initiate");
+
+	challenge_str = malloc(CHALLANGE_SIZE);
+	if (!challenge_str) {
+		radlog(L_ERR, "rlm_eap_gtc: out of memory");
+		return -1;
+	}
+
+	challenge = getChallenge(handler->request->config_items);
+	if (!challenge) {
+		challenge = inst->challenge;
+	}
+
+	radlog(L_ERR, "rlm_eap_gtc: write challange text: \"%s\"", challenge);
+
+	if (!radius_xlat(challenge_str, CHALLANGE_SIZE, challenge, handler->request, NULL)) {
+		radlog(L_ERR, "rlm_eap_gtc: xlat of \"%s\" failed", challenge);
+		free(challenge_str);
 		return 0;
 	}
 
@@ -130,6 +173,7 @@ static int gtc_initiate(void *type_data, EAP_HANDLER *handler)
 	eap_ds->request->type.data = malloc(length);
 	if (eap_ds->request->type.data == NULL) {
 		radlog(L_ERR, "rlm_eap_gtc: out of memory");
+		free(challenge_str);
 		return 0;
 	}
 
@@ -145,6 +189,7 @@ static int gtc_initiate(void *type_data, EAP_HANDLER *handler)
 	 */
 	handler->stage = AUTHENTICATE;
 
+	free(challenge_str);
 	return 1;
 }
 
@@ -157,6 +202,8 @@ static int gtc_authenticate(void *type_data, EAP_HANDLER *handler)
 	VALUE_PAIR *vp;
 	EAP_DS *eap_ds = handler->eap_ds;
 	rlm_eap_gtc_t *inst = (rlm_eap_gtc_t *) type_data;
+
+	radlog(L_ERR, "rlm_eap_gtc: gtc_authenticate");
 
 	/*
 	 *	Get the Cleartext-Password for this user.
@@ -243,6 +290,15 @@ static int gtc_authenticate(void *type_data, EAP_HANDLER *handler)
 		 */
 		pairadd(&handler->request->packet->vps, vp);
 		handler->request->password = vp;
+	 
+		vp = pairmake("Crypt-Password", "", T_OP_EQ);
+		if (!vp) {
+			return 0;
+		}
+		vp->length = handler->prev_eapds->request->type.length;
+		memcpy(vp->vp_strvalue, handler->prev_eapds->request->type.data, vp->length);
+		vp->vp_strvalue[vp->length] = 0;
+		pairadd(&handler->request->packet->vps, vp);
 
 		/*
 		 *	This is a wild & crazy hack.
